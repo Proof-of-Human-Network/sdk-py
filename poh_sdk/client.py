@@ -5,17 +5,19 @@ Async usage (recommended):
     import asyncio
     from poh_sdk import PohClient
 
-    async def main():
-        async with PohClient("https://proofofhuman.ge", api_key="...") as poh:
-            res = await poh.scan("0xabc...")
-            print(res.result)
+    # Single node (legacy):
+    async with PohClient("https://proofofhuman.ge", api_key="...") as poh:
+        res = await poh.scan("0xabc...")
 
-    asyncio.run(main())
+    # Network mode — auto-picks fastest responding node:
+    async with PohClient(nodes=["https://bootnode.proofofhuman.ge",
+                                "https://proofofhuman.ge"]) as poh:
+        res = await poh.scan("0xabc...")
 
 Sync usage:
     from poh_sdk import PohClient
 
-    poh = PohClient.sync("https://proofofhuman.ge", api_key="...")
+    poh = PohClient.sync("https://proofofhuman.ge")
     res = poh.scan_sync("0xabc...")
 """
 from __future__ import annotations
@@ -39,6 +41,44 @@ from .types import (
     ScanWithVerdict,
 )
 
+# Default network nodes used when neither base_url nor nodes is provided.
+DEFAULT_NODES: List[str] = [
+    "https://bootnode.proofofhuman.ge",
+    "https://proofofhuman.ge",
+    "https://poh.assetux.com",
+]
+
+
+async def _probe_node(client: httpx.AsyncClient, url: str) -> str:
+    """HEAD /healthz to measure node liveness. Returns url on success."""
+    try:
+        r = await client.head(f"{url}/healthz", timeout=4.0)
+        if r.status_code < 500:
+            return url
+    except Exception:
+        pass
+    raise ConnectionError(f"Node unreachable: {url}")
+
+
+async def _pick_fastest(nodes: List[str]) -> str:
+    """Race health-checks against all nodes; return first that responds."""
+    if len(nodes) == 1:
+        return nodes[0]
+    async with httpx.AsyncClient() as client:
+        tasks = [asyncio.ensure_future(_probe_node(client, url)) for url in nodes]
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                if not t.exception():
+                    return t.result()
+        except Exception:
+            pass
+    return nodes[0]  # fallback
+
 
 class PohError(Exception):
     """Raised when the POH API returns a non-2xx response."""
@@ -61,7 +101,12 @@ class PohClient:
     Parameters
     ----------
     base_url:
-        Base URL of the POH API, e.g. ``"https://proofofhuman.ge"``.
+        Single-node base URL (legacy), e.g. ``"https://proofofhuman.ge"``.
+        Takes precedence over *nodes* when provided.
+    nodes:
+        List of network node URLs to probe. The client races health-checks and
+        uses the fastest responding node. Falls back to ``DEFAULT_NODES`` when
+        neither *base_url* nor *nodes* is provided.
     api_key:
         API key for paid tier.
     wallet_address:
@@ -72,25 +117,41 @@ class PohClient:
 
     def __init__(
         self,
-        base_url: str,
+        base_url: Optional[str] = None,
         *,
+        nodes:          Optional[List[str]] = None,
         api_key:        Optional[str] = None,
         wallet_address: Optional[str] = None,
         timeout:        float         = 30.0,
     ) -> None:
-        self._base_url       = base_url.rstrip("/")
         self._api_key        = api_key
         self._wallet_address = wallet_address
+        self._timeout        = timeout
+        self._nodes: List[str] = []
+        self._resolved_url: Optional[str] = None
+
         headers: dict = {"Accept": "application/json"}
         if api_key:
             headers["x-api-key"] = api_key
+        self._headers = headers
+
+        if base_url:
+            # Legacy single-node path
+            self._resolved_url = base_url.rstrip("/")
+        else:
+            self._nodes = [u.rstrip("/") for u in (nodes or DEFAULT_NODES)]
+
+        # Build initial client — may be recreated after node discovery
+        url = self._resolved_url or self._nodes[0]
         self._client = httpx.AsyncClient(
-            base_url = self._base_url,
+            base_url = url,
             headers  = headers,
             timeout  = timeout,
         )
 
     async def __aenter__(self) -> "PohClient":
+        if not self._resolved_url and self._nodes:
+            await self._resolve_node()
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -99,9 +160,27 @@ class PohClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def _resolve_node(self) -> None:
+        """Pick the fastest live node and rebuild the HTTP client pointed at it."""
+        url = await _pick_fastest(self._nodes)
+        self._resolved_url = url
+        await self._client.aclose()
+        self._client = httpx.AsyncClient(
+            base_url = url,
+            headers  = self._headers,
+            timeout  = self._timeout,
+        )
+
+    @property
+    def active_node(self) -> Optional[str]:
+        """The URL of the currently selected node (None before context entry)."""
+        return self._resolved_url
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _request(self, method: str, path: str, **kwargs: object) -> dict:
+        if not self._resolved_url and self._nodes:
+            await self._resolve_node()
         try:
             res = await self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
@@ -301,8 +380,9 @@ class PohClient:
     @classmethod
     def sync(
         cls,
-        base_url: str,
+        base_url: Optional[str] = None,
         *,
+        nodes:          Optional[List[str]] = None,
         api_key:        Optional[str] = None,
         wallet_address: Optional[str] = None,
         timeout:        float         = 30.0,
@@ -312,10 +392,13 @@ class PohClient:
         Example::
 
             poh = PohClient.sync("https://proofofhuman.ge")
+            # or network mode:
+            poh = PohClient.sync(nodes=["https://bootnode.proofofhuman.ge"])
             res = poh.scan_sync("0xabc...")
         """
         return _SyncPohClient(
             base_url        = base_url,
+            nodes           = nodes,
             api_key         = api_key,
             wallet_address  = wallet_address,
             timeout         = timeout,
@@ -325,8 +408,14 @@ class PohClient:
 class _SyncPohClient:
     """Synchronous wrapper that runs an event loop internally."""
 
-    def __init__(self, **kwargs: object) -> None:
-        self._kwargs = kwargs
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        *,
+        nodes: Optional[List[str]] = None,
+        **kwargs: object,
+    ) -> None:
+        self._kwargs = {"base_url": base_url, "nodes": nodes, **kwargs}
 
     def _run(self, coro):  # type: ignore[no-untyped-def]
         return asyncio.get_event_loop().run_until_complete(coro)

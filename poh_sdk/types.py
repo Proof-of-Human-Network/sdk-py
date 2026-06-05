@@ -20,21 +20,44 @@ class ScanOptions:
 
 
 @dataclass
+class OfacMatch:
+    """Present in ScanResult.ofac when the address is on the OFAC SDN list."""
+    name:            str
+    program:         str
+    chain_code:      str
+    type:            str   # "direct" | "counterparty"
+    matched_address: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OfacMatch":
+        return cls(
+            name            = d.get("name", ""),
+            program         = d.get("program", ""),
+            chain_code      = d.get("chainCode", ""),
+            type            = d.get("type", "direct"),
+            matched_address = d.get("matchedAddress", ""),
+        )
+
+
+@dataclass
 class ScanResult:
     result:          Optional[bool]
-    brain_key:       Optional[str]  = None
-    free_scans_left: Optional[int]  = None
-    source:          Optional[str]  = None
-    count:           Optional[int]  = None
+    brain_key:       Optional[str]       = None
+    free_scans_left: Optional[int]       = None
+    source:          Optional[str]       = None
+    count:           Optional[int]       = None
+    ofac:            Optional[OfacMatch] = None  # set if address is OFAC-sanctioned
 
     @classmethod
     def from_dict(cls, d: dict) -> "ScanResult":
+        ofac_raw = d.get("ofac")
         return cls(
             result          = d.get("result"),
             brain_key       = d.get("brainKey"),
             free_scans_left = d.get("freeScansLeft"),
             source          = d.get("source"),
             count           = d.get("count"),
+            ofac            = OfacMatch.from_dict(ofac_raw) if ofac_raw and ofac_raw.get("sanctioned") else None,
         )
 
 
