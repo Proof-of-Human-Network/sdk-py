@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "poh-sdk"
-version         = "0.2.0"
+version         = "0.3.0"
 description     = "Proof of Human SDK — scan wallets, poll async jobs, access signal methods"
 readme          = "README.md"
 license         = { text = "MIT" }

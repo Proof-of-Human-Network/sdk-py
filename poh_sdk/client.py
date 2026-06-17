@@ -30,16 +30,30 @@ from urllib.parse import quote
 import httpx
 
 from .types import (
+    AccountNonce,
+    AskJobRef,
+    AskJobResult,
+    AskJobStatus,
+    AskOptions,
     BrainPollOptions,
     BrainVerdict,
     BulkScanResult,
     JobStatus,
     Method,
+    MinerInfo,
+    NodeInfo,
+    PendingTxResult,
     PollOptions,
     ScanOptions,
     ScanResult,
     ScanWithVerdict,
+    Skill,
+    TxHistoryEntry,
+    TxHistoryResult,
+    TxSubmitResult,
+    WalletBalance,
 )
+from .signing import PohTxData
 
 # Default network nodes used when neither base_url nor nodes is provided.
 DEFAULT_NODES: List[str] = [
@@ -375,6 +389,233 @@ class PohClient:
             await self._request("GET", f"/verifyer/{quote(method_id)}")
         )
 
+    # ── Natural language jobs ─────────────────────────────────────────────────
+
+    async def submit_job(
+        self,
+        question: str,
+        options: Optional[AskOptions] = None,
+    ) -> AskJobRef:
+        """Route a natural language question and submit it as a skill job.
+
+        Returns immediately with an :class:`AskJobRef`; use :meth:`poll_job_result`
+        or :meth:`ask_and_wait` to get the answer.
+
+        Raises :class:`PohError` (422) if no skill matches the question.
+
+        Example::
+
+            ref = await poh.submit_job("What does vitalik.eth write on Paragraph?",
+                                       AskOptions(budget=0.5, wallet_address="poh..."))
+            result = await poh.poll_job_result(ref.job_id)
+        """
+        opts      = options or AskOptions()
+        max_budget = round(opts.budget * 1_000_000_000)
+
+        # 1. Route to a skill
+        route = await self._request("POST", "/chat/route", json={
+            "message": question,
+            "budget":  max_budget,
+        })
+        if route.get("type") != "skill" or not route.get("skillId"):
+            raise PohError(
+                route.get("reason") or f"No skill matched: {question!r}", 422
+            )
+
+        # 2. Submit job
+        job_body: dict = {
+            "type":      "skill",
+            "skillId":   route["skillId"],
+            "payload":   route.get("input") or {},
+            "maxBudget": max_budget,
+        }
+        if opts.wallet_address:
+            job_body["requesterAddress"] = opts.wallet_address
+        elif self._wallet_address:
+            job_body["requesterAddress"] = self._wallet_address
+
+        return AskJobRef.from_dict(await self._request("POST", "/job", json=job_body))
+
+    async def get_job_status(self, job_id: str) -> AskJobStatus:
+        """Fetch the current status of a natural language job (without the full result)."""
+        return AskJobStatus.from_dict(
+            await self._request("GET", f"/job/{quote(job_id)}/status")
+        )
+
+    async def get_job_result(self, job_id: str) -> AskJobResult:
+        """Fetch the result of a completed natural language job.
+
+        Returns a result with ``status='computing'`` if the job is not done yet.
+        """
+        if not self._resolved_url and self._nodes:
+            await self._resolve_node()
+        try:
+            res = await self._client.get(f"/job/{quote(job_id)}/result")
+        except httpx.TimeoutException as exc:
+            raise PohError("Request timed out", 408) from exc
+
+        if res.status_code == 202:
+            return AskJobResult(job_id=job_id, status="computing")
+
+        if res.is_error:
+            try:
+                msg = res.json().get("error", res.text)
+            except Exception:
+                msg = res.text or f"HTTP {res.status_code}"
+            raise PohError(str(msg), res.status_code)
+
+        return AskJobResult.from_dict(res.json())
+
+    async def poll_job_result(
+        self,
+        job_id: str,
+        options: Optional[PollOptions] = None,
+    ) -> AskJobResult:
+        """Poll a natural language job until ``done`` or ``error``, then return the result.
+
+        Raises :class:`TimeoutError` if the job does not finish within ``options.timeout`` seconds.
+        """
+        opts     = options or PollOptions()
+        deadline = time.monotonic() + opts.timeout
+
+        while True:
+            s = await self.get_job_status(job_id)
+            if s.status in ("done", "error"):
+                return await self.get_job_result(job_id)
+            if time.monotonic() + opts.interval > deadline:
+                raise TimeoutError(
+                    f"POH job '{job_id}' did not complete within {opts.timeout}s"
+                )
+            await asyncio.sleep(opts.interval)
+
+    async def ask_and_wait(
+        self,
+        question: str,
+        ask_options:  Optional[AskOptions]  = None,
+        poll_options: Optional[PollOptions] = None,
+    ) -> AskJobResult:
+        """Route, submit, and wait for a natural language job in one call.
+
+        Example::
+
+            result = await poh.ask_and_wait(
+                "What does vitalik.eth write about on Paragraph?",
+                AskOptions(budget=0.5, wallet_address="poh..."),
+            )
+            print(result.nl_response or result.output)
+        """
+        ref = await self.submit_job(question, ask_options)
+        return await self.poll_job_result(ref.job_id, poll_options)
+
+    # ── Node info ─────────────────────────────────────────────────────────────
+
+    async def get_node_info(self) -> NodeInfo:
+        """Fetch metadata about the currently connected node.
+
+        Returns node ID, version, wallet address, reputation, and peer count.
+        """
+        return NodeInfo.from_dict(await self._request("GET", "/healthz"))
+
+    async def list_skills(self) -> List[Skill]:
+        """List all skills available on the connected node."""
+        data = await self._request("GET", "/api/skills")
+        if isinstance(data, list):
+            return [Skill.from_dict(s) for s in data]
+        return []
+
+    # ── Miner info ────────────────────────────────────────────────────────────
+
+    async def get_miner_info(self) -> MinerInfo:
+        """Fetch metadata about the connected miner node (address, gas price, model, etc.)."""
+        return MinerInfo.from_dict(await self._request("GET", "/api/miner/info"))
+
+    # ── Wallet / blockchain ───────────────────────────────────────────────────
+
+    async def get_balance(self, address: str) -> WalletBalance:
+        """Return the POH balance for *address* (balance is in μPOH; divide by 1e9 for POH)."""
+        d = await self._request("GET", f"/api/wallet/balance?address={quote(address)}")
+        return WalletBalance(address=d["address"], balance=d["balance"])
+
+    async def get_nonce(self, address: str) -> AccountNonce:
+        """Return the current nonce for *address*. Use ``nonce + 1`` for the next transaction."""
+        d = await self._request("GET", f"/api/wallet/nonce?address={quote(address)}")
+        return AccountNonce(address=d["address"], nonce=d["nonce"])
+
+    async def get_transaction_history(self, address: str, limit: int = 30) -> TxHistoryResult:
+        """Return the transaction history for *address*."""
+        qs = f"address={quote(address)}&limit={limit}"
+        d  = await self._request("GET", f"/api/wallet/history?{qs}")
+        entries = [
+            TxHistoryEntry(
+                height  = e["height"],
+                delta   = e["delta"],
+                tx_hash = e["txHash"],
+                ts      = e["ts"],
+                label   = e["label"],
+            )
+            for e in d.get("entries", [])
+        ]
+        return TxHistoryResult(address=d.get("address", ""), entries=entries)
+
+    async def get_transactions(self, address: str) -> dict:
+        """Return the raw transactions dict for *address*."""
+        return await self._request("GET", f"/api/wallet/transactions?address={quote(address)}")
+
+    async def get_pending_transactions(self) -> PendingTxResult:
+        """Return transactions currently sitting in the miner's queue."""
+        return PendingTxResult.from_dict(await self._request("GET", "/api/tx/pending"))
+
+    async def submit_transaction(self, tx: "PohTxData") -> TxSubmitResult:
+        """Submit a signed :class:`~poh_sdk.signing.PohTxData` to the network."""
+        return TxSubmitResult.from_dict(
+            await self._request("POST", "/api/tx/submit", json=tx.to_dict())
+        )
+
+    async def register_signing_key(
+        self,
+        address: str,
+        signing_public_key: str,
+        proof: str,
+    ) -> dict:
+        """Register a signing public key for *address*.
+
+        *proof* must be a base64 Ed25519 signature of the wallet address string,
+        created with the corresponding private key (see :func:`~poh_sdk.signing.create_signing_proof`).
+        """
+        return await self._request(
+            "POST",
+            "/api/wallet/register-key",
+            json={
+                "address":          address,
+                "signingPublicKey":  signing_public_key,
+                "proof":             proof,
+            },
+        )
+
+    async def transfer(
+        self,
+        from_addr: str,
+        to: str,
+        amount_poh: float,
+        private_key_pem: str,
+        fee: int = 0,
+        memo: str = "",
+    ) -> TxSubmitResult:
+        """Build, sign, and submit a POH transfer in one call.
+
+        Parameters
+        ----------
+        amount_poh:
+            Amount in POH (not μPOH). Converted internally.
+        private_key_pem:
+            PKCS8 PEM-encoded Ed25519 private key used to sign the transaction.
+        """
+        from .signing import build_transfer, sign_transaction
+        nonce_resp = await self.get_nonce(from_addr)
+        tx         = build_transfer(from_addr, to, amount_poh, nonce_resp.nonce + 1, fee, memo)
+        signed     = sign_transaction(tx, private_key_pem)
+        return await self.submit_transaction(signed)
+
     # ── Sync convenience ──────────────────────────────────────────────────────
 
     @classmethod
@@ -489,4 +730,117 @@ class _SyncPohClient:
         async def _go():
             async with self._client() as c:
                 return await c.get_methods(wallet_address)
+        return self._run(_go())
+
+    def submit_job(
+        self, question: str, options: Optional[AskOptions] = None
+    ) -> AskJobRef:
+        async def _go():
+            async with self._client() as c:
+                return await c.submit_job(question, options)
+        return self._run(_go())
+
+    def get_job_status(self, job_id: str) -> AskJobStatus:
+        async def _go():
+            async with self._client() as c:
+                return await c.get_job_status(job_id)
+        return self._run(_go())
+
+    def get_job_result(self, job_id: str) -> AskJobResult:
+        async def _go():
+            async with self._client() as c:
+                return await c.get_job_result(job_id)
+        return self._run(_go())
+
+    def poll_job_result(
+        self, job_id: str, options: Optional[PollOptions] = None
+    ) -> AskJobResult:
+        async def _go():
+            async with self._client() as c:
+                return await c.poll_job_result(job_id, options)
+        return self._run(_go())
+
+    def ask_and_wait(
+        self,
+        question: str,
+        ask_options:  Optional[AskOptions]  = None,
+        poll_options: Optional[PollOptions] = None,
+    ) -> AskJobResult:
+        async def _go():
+            async with self._client() as c:
+                return await c.ask_and_wait(question, ask_options, poll_options)
+        return self._run(_go())
+
+    def get_node_info(self) -> NodeInfo:
+        async def _go():
+            async with self._client() as c:
+                return await c.get_node_info()
+        return self._run(_go())
+
+    def list_skills(self) -> List[Skill]:
+        async def _go():
+            async with self._client() as c:
+                return await c.list_skills()
+        return self._run(_go())
+
+    def get_miner_info(self) -> "MinerInfo":
+        async def _go():
+            async with self._client() as c:
+                return await c.get_miner_info()
+        return self._run(_go())
+
+    def get_balance(self, address: str) -> "WalletBalance":
+        async def _go():
+            async with self._client() as c:
+                return await c.get_balance(address)
+        return self._run(_go())
+
+    def get_nonce(self, address: str) -> "AccountNonce":
+        async def _go():
+            async with self._client() as c:
+                return await c.get_nonce(address)
+        return self._run(_go())
+
+    def get_transaction_history(self, address: str, limit: int = 30) -> "TxHistoryResult":
+        async def _go():
+            async with self._client() as c:
+                return await c.get_transaction_history(address, limit)
+        return self._run(_go())
+
+    def get_transactions(self, address: str) -> dict:
+        async def _go():
+            async with self._client() as c:
+                return await c.get_transactions(address)
+        return self._run(_go())
+
+    def get_pending_transactions(self) -> "PendingTxResult":
+        async def _go():
+            async with self._client() as c:
+                return await c.get_pending_transactions()
+        return self._run(_go())
+
+    def submit_transaction(self, tx: "PohTxData") -> "TxSubmitResult":
+        async def _go():
+            async with self._client() as c:
+                return await c.submit_transaction(tx)
+        return self._run(_go())
+
+    def register_signing_key(self, address: str, signing_public_key: str, proof: str) -> dict:
+        async def _go():
+            async with self._client() as c:
+                return await c.register_signing_key(address, signing_public_key, proof)
+        return self._run(_go())
+
+    def transfer(
+        self,
+        from_addr: str,
+        to: str,
+        amount_poh: float,
+        private_key_pem: str,
+        fee: int = 0,
+        memo: str = "",
+    ) -> "TxSubmitResult":
+        async def _go():
+            async with self._client() as c:
+                return await c.transfer(from_addr, to, amount_poh, private_key_pem, fee, memo)
         return self._run(_go())
