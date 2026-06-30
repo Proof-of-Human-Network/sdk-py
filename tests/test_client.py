@@ -210,6 +210,7 @@ async def test_scan_and_verdict_returns_not_found_when_no_brain_key():
 
 @pytest.mark.asyncio
 async def test_submit_job_routes_and_returns_job_ref():
+    # budget=0 (free job) — no signed payment required.
     with respx.mock:
         respx.post(f"{BASE}/chat/route").mock(return_value=Response(200, json={
             "type": "skill", "skillId": "sk-sum", "input": {}
@@ -219,8 +220,56 @@ async def test_submit_job_routes_and_returns_job_ref():
         }))
         async with PohClient(BASE) as poh:
             from poh_sdk.types import AskOptions
-            ref = await poh.submit_job("Summarise this", AskOptions(budget=0.1))
+            ref = await poh.submit_job("Summarise this", AskOptions(budget=0))
     assert ref.job_id == "jnl-1"
+
+
+@pytest.mark.asyncio
+async def test_submit_job_raises_when_budget_positive_without_private_key():
+    with respx.mock:
+        respx.post(f"{BASE}/chat/route").mock(return_value=Response(200, json={
+            "type": "skill", "skillId": "sk-sum", "input": {}
+        }))
+        async with PohClient(BASE) as poh:
+            from poh_sdk.types import AskOptions
+            with pytest.raises(PohError) as exc_info:
+                await poh.submit_job("Summarise this", AskOptions(budget=0.5, wallet_address="pohAlice"))
+    assert exc_info.value.status == 402
+
+
+@pytest.mark.asyncio
+async def test_submit_job_signs_a_nonce_bound_payment_proof_when_budget_positive():
+    from poh_sdk.signing import generate_key_pair
+    priv, _ = generate_key_pair()
+    captured = {}
+
+    def capture_job(request):
+        captured["body"] = json.loads(request.content)
+        return Response(200, json={"jobId": "jnl-1", "status": "queued"})
+
+    with respx.mock:
+        respx.post(f"{BASE}/chat/route").mock(return_value=Response(200, json={
+            "type": "skill", "skillId": "sk-sum", "input": {}
+        }))
+        respx.get(f"{BASE}/api/miner/info").mock(return_value=Response(200, json={
+            "minerAddress": "pohMiner", "gasPrice": 1, "model": "qwen2.5:1.5b",
+            "queueLength": 0, "reputation": 1.0,
+        }))
+        respx.get(f"{BASE}/api/wallet/nonce").mock(return_value=Response(200, json={
+            "address": "pohAlice", "nonce": 3,
+        }))
+        respx.post(f"{BASE}/job").mock(side_effect=capture_job)
+        async with PohClient(BASE) as poh:
+            from poh_sdk.types import AskOptions
+            ref = await poh.submit_job("Summarise this", AskOptions(
+                budget=0.5, wallet_address="pohAlice", private_key_pem=priv,
+            ))
+    assert ref.job_id == "jnl-1"
+    body = captured["body"]
+    assert body["maxBudget"] == 500_000_000
+    assert body["requesterAddress"] == "pohAlice"
+    assert body["paymentTx"]["txHash"]
+    assert body["paymentTx"]["signature"]
 
 
 @pytest.mark.asyncio
@@ -234,6 +283,54 @@ async def test_submit_job_raises_when_no_skill_matched():
             with pytest.raises(PohError) as exc_info:
                 await poh.submit_job("random question")
     assert exc_info.value.status == 422
+
+
+@pytest.mark.asyncio
+async def test_run_compute_raises_when_budget_not_positive():
+    from poh_sdk.signing import generate_key_pair
+    from poh_sdk.types import ComputeOptions
+    priv, _ = generate_key_pair()
+    async with PohClient(BASE) as poh:
+        with pytest.raises(PohError) as exc_info:
+            await poh.run_compute("hi", ComputeOptions(
+                model="qwen2.5:1.5b", budget=0, wallet_address="pohAlice", private_key_pem=priv,
+            ))
+    assert exc_info.value.status == 402
+
+
+@pytest.mark.asyncio
+async def test_run_compute_signs_payment_and_posts_model_dataset():
+    from poh_sdk.signing import generate_key_pair
+    from poh_sdk.types import ComputeOptions
+    priv, _ = generate_key_pair()
+    captured = {}
+
+    def capture_job(request):
+        captured["body"] = json.loads(request.content)
+        return Response(200, json={"jobId": "jc-1", "status": "queued"})
+
+    with respx.mock:
+        respx.get(f"{BASE}/api/miner/info").mock(return_value=Response(200, json={
+            "minerAddress": "pohMiner", "gasPrice": 1, "model": "qwen2.5:1.5b",
+            "queueLength": 0, "reputation": 1.0,
+        }))
+        respx.get(f"{BASE}/api/wallet/nonce").mock(return_value=Response(200, json={
+            "address": "pohAlice", "nonce": 7,
+        }))
+        respx.post(f"{BASE}/job").mock(side_effect=capture_job)
+        async with PohClient(BASE) as poh:
+            ref = await poh.run_compute("Summarize the top rows", ComputeOptions(
+                model="llama3.1:8b", dataset="some-org/some-dataset",
+                budget=0.5, wallet_address="pohAlice", private_key_pem=priv,
+            ))
+    assert ref.job_id == "jc-1"
+    body = captured["body"]
+    assert body["model"] == "llama3.1:8b"
+    assert body["dataset"] == "some-org/some-dataset"
+    assert body["maxBudget"] == 500_000_000
+    assert body["payload"]["prompt"] == "Summarize the top rows"
+    assert body["paymentTx"]["txHash"]
+    assert body["paymentTx"]["signature"]
 
 
 @pytest.mark.asyncio

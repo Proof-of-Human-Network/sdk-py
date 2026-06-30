@@ -211,6 +211,27 @@ class AskOptions:
     """Budget in POH units (e.g. 0.5 = 0.5 POH). Required for skill jobs."""
     wallet_address: Optional[str] = None
     """Wallet address to charge the budget from. Required when budget > 0."""
+    private_key_pem: Optional[str] = None
+    """PKCS8 PEM Ed25519 private key used to sign the fee payment. Required when
+    budget > 0 — skill jobs always require a fee, and the node rejects the job
+    outright without a valid signed payment proof."""
+
+
+@dataclass
+class ComputeOptions:
+    """Options for submitting a paid compute job (user-specified model + dataset)."""
+    model: str
+    """Which model to run, e.g. 'qwen2.5:1.5b', 'llama3.1:8b'."""
+    budget: float
+    """Fee in POH (e.g. 0.5 = 0.5 POH). Required — compute jobs are never free."""
+    wallet_address: str
+    """Wallet address paying the fee."""
+    private_key_pem: str
+    """PKCS8 PEM Ed25519 private key used to sign the fee payment."""
+    dataset: Optional[str] = None
+    """Optional Hugging Face dataset id to ground the answer in (must be installed on the node)."""
+    job_id: Optional[str] = None
+    """Optional explicit job id. Auto-generated if omitted."""
 
 
 @dataclass

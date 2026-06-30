@@ -18,12 +18,13 @@ Sync usage:
     from poh_sdk import PohClient
 
     poh = PohClient.sync("https://proofofhuman.ge")
-    res = poh.scan_sync("0xabc...")
+    res = poh.scan("0xabc...")
 """
 from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from typing import AsyncIterator, List, Optional
 from urllib.parse import quote
 
@@ -38,6 +39,7 @@ from .types import (
     BrainPollOptions,
     BrainVerdict,
     BulkScanResult,
+    ComputeOptions,
     JobStatus,
     Method,
     MinerInfo,
@@ -53,7 +55,7 @@ from .types import (
     TxSubmitResult,
     WalletBalance,
 )
-from .signing import PohTxData
+from .signing import PohTxData, sign_job_payment
 
 # Default network nodes used when neither base_url nor nodes is provided.
 DEFAULT_NODES: List[str] = [
@@ -403,10 +405,14 @@ class PohClient:
 
         Raises :class:`PohError` (422) if no skill matches the question.
 
+        Skill jobs always require a fee — pass ``budget``, ``wallet_address``, and
+        ``private_key_pem`` so the request can be signed. The node verifies the
+        signature and debits the fee before it will run the job at all.
+
         Example::
 
             ref = await poh.submit_job("What does vitalik.eth write on Paragraph?",
-                                       AskOptions(budget=0.5, wallet_address="poh..."))
+                AskOptions(budget=0.5, wallet_address="poh...", private_key_pem=my_key))
             result = await poh.poll_job_result(ref.job_id)
         """
         opts      = options or AskOptions()
@@ -423,17 +429,72 @@ class PohClient:
             )
 
         # 2. Submit job
+        requester_address = opts.wallet_address or self._wallet_address
+        job_id = f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
         job_body: dict = {
+            "id":        job_id,
             "type":      "skill",
             "skillId":   route["skillId"],
             "payload":   route.get("input") or {},
             "maxBudget": max_budget,
         }
-        if opts.wallet_address:
-            job_body["requesterAddress"] = opts.wallet_address
-        elif self._wallet_address:
-            job_body["requesterAddress"] = self._wallet_address
+        if requester_address:
+            job_body["requesterAddress"] = requester_address
 
+        if max_budget > 0:
+            if not requester_address or not opts.private_key_pem:
+                raise PohError(
+                    "submit_job: wallet_address and private_key_pem are required when "
+                    "budget > 0 — skill jobs always require a signed fee.",
+                    402,
+                )
+            miner_info = await self.get_miner_info()
+            nonce_info = await self.get_nonce(requester_address)
+            job_body["paymentTx"] = sign_job_payment(
+                job_id, requester_address, miner_info.miner_address,
+                max_budget, nonce_info.nonce, opts.private_key_pem,
+            )
+
+        return AskJobRef.from_dict(await self._request("POST", "/job", json=job_body))
+
+    async def run_compute(self, prompt: str, options: ComputeOptions) -> AskJobRef:
+        """Submit a paid compute job that runs a user-specified model (and,
+        optionally, grounds the answer in a Hugging Face dataset already
+        installed on the node). Compute jobs are never free — the node rejects
+        the request outright unless it carries a valid signed fee payment.
+
+        Example::
+
+            ref = await poh.run_compute("Summarize the top 5 rows", ComputeOptions(
+                model="llama3.1:8b", dataset="some-org/some-dataset",
+                budget=0.5, wallet_address=my_address, private_key_pem=my_key,
+            ))
+            result = await poh.poll_job_result(ref.job_id)
+        """
+        if not (options.budget > 0):
+            raise PohError("run_compute: budget must be > 0 — compute jobs always require a fee", 402)
+
+        job_id     = options.job_id or f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        max_budget = round(options.budget * 1_000_000_000)
+
+        miner_info = await self.get_miner_info()
+        nonce_info = await self.get_nonce(options.wallet_address)
+        payment_tx = sign_job_payment(
+            job_id, options.wallet_address, miner_info.miner_address,
+            max_budget, nonce_info.nonce, options.private_key_pem,
+        )
+
+        job_body: dict = {
+            "id":               job_id,
+            "type":             "compute",
+            "model":            options.model,
+            "dataset":          options.dataset,
+            "payload":          {"prompt": prompt},
+            "maxBudget":        max_budget,
+            "requesterAddress": options.wallet_address,
+            "paymentTx":        payment_tx,
+        }
         return AskJobRef.from_dict(await self._request("POST", "/job", json=job_body))
 
     async def get_job_status(self, job_id: str) -> AskJobStatus:
@@ -635,7 +696,7 @@ class PohClient:
             poh = PohClient.sync("https://proofofhuman.ge")
             # or network mode:
             poh = PohClient.sync(nodes=["https://bootnode.proofofhuman.ge"])
-            res = poh.scan_sync("0xabc...")
+            res = poh.scan("0xabc...")
         """
         return _SyncPohClient(
             base_url        = base_url,
@@ -738,6 +799,12 @@ class _SyncPohClient:
         async def _go():
             async with self._client() as c:
                 return await c.submit_job(question, options)
+        return self._run(_go())
+
+    def run_compute(self, prompt: str, options: ComputeOptions) -> AskJobRef:
+        async def _go():
+            async with self._client() as c:
+                return await c.run_compute(prompt, options)
         return self._run(_go())
 
     def get_job_status(self, job_id: str) -> AskJobStatus:

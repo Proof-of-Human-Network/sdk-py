@@ -112,7 +112,13 @@ def compute_tx_hash(
     timestamp: int,
     memo: str,
 ) -> str:
-    """Return the SHA-256 hex digest of the canonical transaction payload."""
+    """Return the SHA-256 hex digest of the canonical transaction payload.
+
+    Must byte-for-byte match the node's ``JSON.stringify`` output (no whitespace),
+    since the node recomputes this hash from the transaction's own fields and
+    rejects the transaction if it doesn't match — ``separators=(",", ":")`` is
+    required here, not cosmetic.
+    """
     payload = json.dumps({
         "from":      from_addr,
         "to":        to,
@@ -121,7 +127,7 @@ def compute_tx_hash(
         "nonce":     nonce,
         "timestamp": timestamp,
         "memo":      memo,
-    })
+    }, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -173,3 +179,49 @@ def sign_transaction(tx: PohTxData, private_key_pem: str) -> PohTxData:
         signature          = base64.b64encode(sig).decode(),
         signing_public_key = pub_pem,
     )
+
+
+# ── Job fee payment ──────────────────────────────────────────────────────────
+
+def compute_job_payment_hash(
+    job_id: str,
+    requester_address: str,
+    miner_address: str,
+    amount: int,
+    nonce: int,
+) -> str:
+    """Compute the canonical payment hash for a job fee.
+
+    Binds the fee to one specific job + miner + amount + nonce, so a signature
+    over it can't be replayed against a different job or a higher budget. Must
+    byte-for-byte match the node's own ``computeJobPaymentHash`` — uses compact
+    JSON separators (no whitespace), matching JavaScript's ``JSON.stringify``.
+    """
+    payload = json.dumps({
+        "jobId":            job_id,
+        "requesterAddress": requester_address,
+        "minerAddress":     miner_address,
+        "amount":           amount,
+        "nonce":            nonce,
+    }, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def sign_job_payment(
+    job_id: str,
+    requester_address: str,
+    miner_address: str,
+    amount: int,
+    nonce: int,
+    private_key_pem: str,
+) -> dict:
+    """Sign a fee payment authorizing a fee-required job (skill execution, or a
+    model/dataset compute job).
+
+    The result (``{"txHash": ..., "signature": ...}``) goes in the ``paymentTx``
+    field of a ``POST /job`` request — the node verifies the signature and debits
+    the requester's balance before it will run the job at all.
+    """
+    tx_hash = compute_job_payment_hash(job_id, requester_address, miner_address, amount, nonce)
+    signature = sign_data(tx_hash, private_key_pem)
+    return {"txHash": tx_hash, "signature": signature}

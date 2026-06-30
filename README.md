@@ -27,25 +27,35 @@ asyncio.run(main())
 
 ## Sync usage
 
-All async methods have a `_sync` counterpart:
+Use `PohClient.sync(...)` to get a synchronous wrapper exposing the same
+methods (no `_sync` suffix) without `await`:
 
 ```python
 from poh_sdk import PohClient
 
-poh = PohClient("https://proofofhuman.ge")
-result = poh.scan_sync("0xabc...")
-balance = poh.get_balance_sync("poh...")
+poh = PohClient.sync("https://proofofhuman.ge")
+result = poh.scan("0xabc...")
+balance = poh.get_balance("poh...")
 ```
 
 ## Natural language jobs
 
+Skill jobs always require a fee — pass `budget` (POH), `wallet_address`, and
+`private_key_pem` in `AskOptions` so the SDK can sign the payment. The node
+verifies the signature and debits the fee before it will run the job at all;
+it rejects the request outright (no job ever runs) without a valid signed
+payment.
+
 ```python
+from poh_sdk import AskOptions
+
 async with PohClient("https://proofofhuman.ge") as poh:
+    options = AskOptions(budget=0.5, wallet_address="poh...", private_key_pem=my_private_key)
+
     # Submit a question
     ref = await poh.submit_job(
         "What does vitalik.eth write about on Paragraph?",
-        budget=0.5,
-        wallet_address="poh...",
+        options,
     )
 
     # Wait for the answer
@@ -54,12 +64,33 @@ async with PohClient("https://proofofhuman.ge") as poh:
     print(result.nl_response)  # LLM natural-language answer
 
     # One-liner convenience
-    result = await poh.ask_and_wait(
-        "What NFTs does gmoney.eth hold?",
-        budget=0.5,
-        wallet_address="poh...",
-    )
+    result = await poh.ask_and_wait("What NFTs does gmoney.eth hold?", options)
 ```
+
+## Compute jobs (your own model + dataset)
+
+Run inference with a model of your choice, optionally grounded in a Hugging
+Face dataset already installed on the node. Like skill jobs, compute jobs
+are never free — `run_compute` always signs a fee payment.
+
+```python
+from poh_sdk import ComputeOptions
+
+async with PohClient("https://proofofhuman.ge") as poh:
+    ref = await poh.run_compute("Summarize the top 5 rows", ComputeOptions(
+        model="llama3.1:8b",
+        dataset="some-org/some-dataset",  # optional
+        budget=0.5,                       # POH
+        wallet_address="poh...",
+        private_key_pem=my_private_key,
+    ))
+    result = await poh.poll_job_result(ref.job_id)
+    print(result.output)
+```
+
+Before either of these will work, the wallet's signing key must be registered
+with the node once via `register_signing_key()` — the node has no way to
+verify a signature for a key it has never seen.
 
 ## Wallet / blockchain
 
@@ -155,11 +186,12 @@ poh = PohClient(nodes=[
 
 | Method | Description |
 |--------|-------------|
-| `submit_job(question, budget, wallet_address)` | Submit NL question |
+| `submit_job(question, options?)` | Submit NL question (`AskOptions`). Skill jobs always require a fee — pass `budget`, `wallet_address`, `private_key_pem`. |
+| `run_compute(prompt, options)` | Submit a job that runs a specific `model` (and optional `dataset`); `ComputeOptions`. Always requires a fee. |
 | `get_job_status(job_id)` | Poll status |
 | `get_job_result(job_id)` | Fetch result |
 | `poll_job_result(job_id, opts?)` | Poll until result ready |
-| `ask_and_wait(question, budget, wallet_address)` | Submit + wait |
+| `ask_and_wait(question, ask_options?, poll_options?)` | Submit + wait |
 
 ### Wallet / blockchain
 
@@ -183,6 +215,8 @@ poh = PohClient(nodes=[
 | `build_transfer(from, to, amount_poh, nonce, fee?, memo?)` | Build unsigned tx |
 | `sign_transaction(tx, private_key_pem)` | Sign a PohTxData |
 | `compute_tx_hash(...)` | SHA-256 tx hash hex |
+| `compute_job_payment_hash(...)` | Canonical hash for a job fee payment (used internally by `submit_job`/`run_compute`) |
+| `sign_job_payment(...)` | Sign a job fee payment proof (used internally by `submit_job`/`run_compute`) |
 
 ### Node info
 

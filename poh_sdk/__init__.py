@@ -2,10 +2,12 @@ from .client import PohClient, PohError
 from .signing import (
     PohTxData,
     build_transfer,
+    compute_job_payment_hash,
     compute_tx_hash,
     create_signing_proof,
     generate_key_pair,
     sign_data,
+    sign_job_payment,
     sign_transaction,
 )
 from .types import (
@@ -17,6 +19,7 @@ from .types import (
     BrainPollOptions,
     BrainVerdict,
     BulkScanResult,
+    ComputeOptions,
     JobStatus,
     KeyPair,
     Method,
@@ -42,10 +45,12 @@ __all__ = [
     # Signing utilities
     "PohTxData",
     "build_transfer",
+    "compute_job_payment_hash",
     "compute_tx_hash",
     "create_signing_proof",
     "generate_key_pair",
     "sign_data",
+    "sign_job_payment",
     "sign_transaction",
     # Scan types
     "AskJobRef",
@@ -55,6 +60,7 @@ __all__ = [
     "BrainPollOptions",
     "BrainVerdict",
     "BulkScanResult",
+    "ComputeOptions",
     "JobStatus",
     "Method",
     "NodeInfo",

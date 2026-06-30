@@ -11,6 +11,8 @@ from poh_sdk.signing import (
     sign_data,
     create_signing_proof,
     compute_tx_hash,
+    compute_job_payment_hash,
+    sign_job_payment,
     build_transfer,
     sign_transaction,
     PohTxData,
@@ -103,10 +105,14 @@ def test_compute_tx_hash_differs_for_different_amounts():
 
 
 def test_compute_tx_hash_matches_sha256_of_canonical_json():
+    # Must use compact separators (no whitespace) — this must byte-for-byte match the
+    # node's JSON.stringify() output, since the node recomputes and verifies this hash
+    # server-side (see WalletManager.applyTransaction in miner/node).
     from_addr, to, amount, fee, nonce, timestamp, memo = "pohA", "pohB", 1_000_000_000, 0, 1, 1700000000000, ""
     canonical = json.dumps(
         {"from": from_addr, "to": to, "amount": amount, "fee": fee,
-         "nonce": nonce, "timestamp": timestamp, "memo": memo}
+         "nonce": nonce, "timestamp": timestamp, "memo": memo},
+        separators=(",", ":"),
     )
     expected = hashlib.sha256(canonical.encode()).hexdigest()
     assert compute_tx_hash(from_addr, to, amount, fee, nonce, timestamp, memo) == expected
@@ -191,3 +197,43 @@ def test_to_dict_includes_all_fields_when_signed():
     assert "txHash" in d
     assert "signature" in d
     assert "signingPublicKey" in d
+
+
+# ── job payment ────────────────────────────────────────────────────────────────
+
+def test_compute_job_payment_hash_returns_64_char_hex():
+    h = compute_job_payment_hash("job-1", "pohA", "pohMiner", 500_000_000, 0)
+    assert len(h) == 64
+    int(h, 16)  # raises if not valid hex
+
+
+def test_compute_job_payment_hash_is_deterministic():
+    args = ("job-1", "pohA", "pohMiner", 500_000_000, 0)
+    assert compute_job_payment_hash(*args) == compute_job_payment_hash(*args)
+
+
+def test_compute_job_payment_hash_differs_for_different_amounts():
+    h1 = compute_job_payment_hash("job-1", "pohA", "pohMiner", 500_000_000, 0)
+    h2 = compute_job_payment_hash("job-1", "pohA", "pohMiner", 999_000_000, 0)
+    assert h1 != h2
+
+
+def test_compute_job_payment_hash_matches_node_reference_value():
+    # Fixed value computed by the node's own algorithm — crypto.createHash('sha256')
+    # .update(JSON.stringify({jobId,requesterAddress,minerAddress,amount,nonce}))
+    # .digest('hex') — for these exact inputs. The node recomputes and verifies this
+    # hash server-side, so any mismatch here means real jobs submitted by this SDK
+    # would be rejected outright.
+    h = compute_job_payment_hash("job-abc", "pohAlice", "pohMiner", 500_000_000, 3)
+    assert h == "1ed86280c1ab64d60d55a232a1c339299d32d8bd45e5f2bf26ff72b26d8908c0"
+
+
+def test_sign_job_payment_returns_tx_hash_and_signature():
+    priv_pem, pub_pem = generate_key_pair()
+    proof = sign_job_payment("job-1", "pohA", "pohMiner", 500_000_000, 0, priv_pem)
+    assert proof["txHash"] == compute_job_payment_hash("job-1", "pohA", "pohMiner", 500_000_000, 0)
+    assert proof["signature"]
+
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    pub_key = load_pem_public_key(pub_pem.encode())
+    pub_key.verify(base64.b64decode(proof["signature"]), proof["txHash"].encode())
