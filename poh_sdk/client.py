@@ -136,6 +136,7 @@ class PohClient:
         base_url: Optional[str] = None,
         *,
         nodes:          Optional[List[str]] = None,
+        local_base_url: Optional[str] = None,
         api_key:        Optional[str] = None,
         wallet_address: Optional[str] = None,
         timeout:        float         = 30.0,
@@ -143,6 +144,7 @@ class PohClient:
         self._api_key        = api_key
         self._wallet_address = wallet_address
         self._timeout        = timeout
+        self._local_base_url = local_base_url.rstrip("/") if local_base_url else None
         self._nodes: List[str] = []
         self._resolved_url: Optional[str] = None
 
@@ -194,11 +196,42 @@ class PohClient:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    async def _request(self, method: str, path: str, **kwargs: object) -> dict:
+    @staticmethod
+    def _needs_local_node(method: str, path: str) -> bool:
+        m = method.upper()
+        if m in ("GET", "HEAD", "OPTIONS"):
+            return False
+        p = path.split("?")[0]
+        return not (m == "POST" and p == "/gossip")
+
+    @staticmethod
+    def _is_loopback(url: str) -> bool:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return host in ("localhost", "127.0.0.1", "::1")
+
+    async def _resolve_base_url(self, method: str, path: str) -> str:
+        if not self._needs_local_node(method, path):
+            if not self._resolved_url and self._nodes:
+                await self._resolve_node()
+            return self._resolved_url or self._nodes[0]
+        if self._local_base_url:
+            return self._local_base_url
         if not self._resolved_url and self._nodes:
             await self._resolve_node()
+        base = self._resolved_url or self._nodes[0]
+        if self._is_loopback(base):
+            return base
+        raise PohError(
+            'This operation requires a local miner node. Pass local_base_url="http://127.0.0.1:3456".',
+            403,
+        )
+
+    async def _request(self, method: str, path: str, **kwargs: object) -> dict:
+        base = await self._resolve_base_url(method, path)
+        url  = f"{base}{path}"
         try:
-            res = await self._client.request(method, path, **kwargs)
+            res = await self._client.request(method, url, **kwargs)
         except httpx.TimeoutException as exc:
             raise PohError("Request timed out", 408) from exc
 
@@ -582,6 +615,8 @@ class PohClient:
         data = await self._request("GET", "/api/skills")
         if isinstance(data, list):
             return [Skill.from_dict(s) for s in data]
+        if isinstance(data, dict) and isinstance(data.get("skills"), list):
+            return [Skill.from_dict(s) for s in data["skills"]]
         return []
 
     # ── Miner info ────────────────────────────────────────────────────────────
@@ -600,7 +635,11 @@ class PohClient:
     async def get_nonce(self, address: str) -> AccountNonce:
         """Return the current nonce for *address*. Use ``nonce + 1`` for the next transaction."""
         d = await self._request("GET", f"/api/wallet/nonce?address={quote(address)}")
-        return AccountNonce(address=d["address"], nonce=d["nonce"])
+        return AccountNonce(
+            address=d["address"],
+            nonce=d["nonce"],
+            pending_nonce=d.get("pendingNonce"),
+        )
 
     async def get_transaction_history(self, address: str, limit: int = 30) -> TxHistoryResult:
         """Return the transaction history for *address*."""
@@ -637,20 +676,34 @@ class PohClient:
         address: str,
         signing_public_key: str,
         proof: str,
+        rotation_proof: Optional[str] = None,
     ) -> dict:
         """Register a signing public key for *address*.
 
-        *proof* must be a base64 Ed25519 signature of the wallet address string,
-        created with the corresponding private key (see :func:`~poh_sdk.signing.create_signing_proof`).
+        *address* must equal :func:`~poh_sdk.signing.derive_address_from_signing_key`.
+        *proof* must be a base64 Ed25519 signature of the wallet address string.
+        Pass *rotation_proof* when replacing an existing registered key.
         """
-        return await self._request(
-            "POST",
-            "/api/wallet/register-key",
-            json={
-                "address":          address,
-                "signingPublicKey":  signing_public_key,
-                "proof":             proof,
-            },
+        body: dict = {
+            "address":          address,
+            "signingPublicKey": signing_public_key,
+            "proof":            proof,
+        }
+        if rotation_proof:
+            body["rotationProof"] = rotation_proof
+        return await self._request("POST", "/api/wallet/register-key", json=body)
+
+    async def register_key_pair(
+        self,
+        key_pair: "KeyPair",
+        rotation_proof: Optional[str] = None,
+    ) -> dict:
+        """Register a :class:`~poh_sdk.types.KeyPair` from :func:`~poh_sdk.signing.generate_key_pair`."""
+        from .signing import create_signing_proof
+        from .types import KeyPair
+        proof = create_signing_proof(key_pair.address, key_pair.signing_private_key)
+        return await self.register_signing_key(
+            key_pair.address, key_pair.signing_public_key, proof, rotation_proof,
         )
 
     async def transfer(
@@ -673,7 +726,8 @@ class PohClient:
         """
         from .signing import build_transfer, sign_transaction
         nonce_resp = await self.get_nonce(from_addr)
-        tx         = build_transfer(from_addr, to, amount_poh, nonce_resp.nonce + 1, fee, memo)
+        next_nonce = (nonce_resp.pending_nonce if nonce_resp.pending_nonce is not None else nonce_resp.nonce) + 1
+        tx         = build_transfer(from_addr, to, amount_poh, next_nonce, fee, memo)
         signed     = sign_transaction(tx, private_key_pem)
         return await self.submit_transaction(signed)
 
@@ -685,6 +739,7 @@ class PohClient:
         base_url: Optional[str] = None,
         *,
         nodes:          Optional[List[str]] = None,
+        local_base_url: Optional[str] = None,
         api_key:        Optional[str] = None,
         wallet_address: Optional[str] = None,
         timeout:        float         = 30.0,
@@ -701,6 +756,7 @@ class PohClient:
         return _SyncPohClient(
             base_url        = base_url,
             nodes           = nodes,
+            local_base_url  = local_base_url,
             api_key         = api_key,
             wallet_address  = wallet_address,
             timeout         = timeout,
@@ -892,10 +948,18 @@ class _SyncPohClient:
                 return await c.submit_transaction(tx)
         return self._run(_go())
 
-    def register_signing_key(self, address: str, signing_public_key: str, proof: str) -> dict:
+    def register_signing_key(
+        self,
+        address: str,
+        signing_public_key: str,
+        proof: str,
+        rotation_proof: Optional[str] = None,
+    ) -> dict:
         async def _go():
             async with self._client() as c:
-                return await c.register_signing_key(address, signing_public_key, proof)
+                return await c.register_signing_key(
+                    address, signing_public_key, proof, rotation_proof,
+                )
         return self._run(_go())
 
     def transfer(

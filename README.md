@@ -123,14 +123,17 @@ from poh_sdk import (
     create_signing_proof,
 )
 
-# 1. Generate a keypair
-kp = generate_key_pair()  # returns (private_pem, public_pem)
-private_key_pem, public_key_pem = kp
+# 1. Generate a keypair — address is derived from the signing public key
+private_key_pem, public_key_pem, my_address = generate_key_pair()
 
-# 2. Register the public key with the node (one-time)
-proof = create_signing_proof(my_address, private_key_pem)
-async with PohClient("https://proofofhuman.ge") as poh:
-    await poh.register_signing_key(my_address, public_key_pem, proof)
+# 2. Register the public key with your local node (one-time)
+async with PohClient(
+    "https://bootnode.proofofhuman.ge",
+    local_base_url="http://127.0.0.1:3456",
+) as poh:
+    await poh.register_signing_key(
+        my_address, public_key_pem, create_signing_proof(my_address, private_key_pem)
+    )
 
     # 3. Build, sign, and submit a transfer
     nonce_resp = await poh.get_nonce(my_address)

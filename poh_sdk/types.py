@@ -359,6 +359,7 @@ class WalletBalance:
 class AccountNonce:
     address: str
     nonce: int
+    pending_nonce: Optional[int] = None
 
 
 @dataclass
@@ -424,3 +425,4 @@ class MinerInfo:
 class KeyPair:
     signing_private_key: str  # PKCS8 PEM
     signing_public_key: str   # SPKI PEM
+    address: str              # poh… address derived from signing_public_key

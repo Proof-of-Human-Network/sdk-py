@@ -8,8 +8,10 @@ cryptography = pytest.importorskip("cryptography")
 
 from poh_sdk.signing import (
     generate_key_pair,
+    derive_address_from_signing_key,
     sign_data,
     create_signing_proof,
+    create_rotation_proof,
     compute_tx_hash,
     compute_job_payment_hash,
     sign_job_payment,
@@ -21,25 +23,26 @@ from poh_sdk.signing import (
 
 # ── generate_key_pair ─────────────────────────────────────────────────────────
 
-def test_generate_key_pair_returns_pem_strings():
-    priv_pem, pub_pem = generate_key_pair()
+def test_generate_key_pair_returns_pem_strings_and_address():
+    priv_pem, pub_pem, address = generate_key_pair()
     assert "-----BEGIN PRIVATE KEY-----" in priv_pem
-    assert "-----END PRIVATE KEY-----" in priv_pem
     assert "-----BEGIN PUBLIC KEY-----" in pub_pem
-    assert "-----END PUBLIC KEY-----" in pub_pem
+    assert address == derive_address_from_signing_key(pub_pem)
+    assert address.startswith("poh") and len(address) == 43
 
 
 def test_generate_key_pair_produces_different_keys_each_call():
-    priv1, pub1 = generate_key_pair()
-    priv2, pub2 = generate_key_pair()
+    priv1, pub1, addr1 = generate_key_pair()
+    priv2, pub2, addr2 = generate_key_pair()
     assert priv1 != priv2
     assert pub1 != pub2
+    assert addr1 != addr2
 
 
 # ── sign_data / create_signing_proof ──────────────────────────────────────────
 
 def test_sign_data_returns_base64_string():
-    priv_pem, _ = generate_key_pair()
+    priv_pem, _, _ = generate_key_pair()
     sig = sign_data("hello world", priv_pem)
     assert isinstance(sig, str)
     # Ed25519 sig = 64 bytes → standard base64 = 88 chars
@@ -47,32 +50,40 @@ def test_sign_data_returns_base64_string():
 
 
 def test_sign_data_is_deterministic():
-    priv_pem, _ = generate_key_pair()
+    priv_pem, _, _ = generate_key_pair()
     sig1 = sign_data("same message", priv_pem)
     sig2 = sign_data("same message", priv_pem)
     assert sig1 == sig2
 
 
 def test_sign_data_differs_for_different_messages():
-    priv_pem, _ = generate_key_pair()
+    priv_pem, _, _ = generate_key_pair()
     sig1 = sign_data("message-A", priv_pem)
     sig2 = sign_data("message-B", priv_pem)
     assert sig1 != sig2
 
 
 def test_create_signing_proof_equals_sign_data_of_address():
-    priv_pem, _ = generate_key_pair()
-    address = "poh_test_address"
+    priv_pem, pub_pem, address = generate_key_pair()
     proof = create_signing_proof(address, priv_pem)
     direct = sign_data(address, priv_pem)
     assert proof == direct
+    assert address == derive_address_from_signing_key(pub_pem)
+
+
+def test_create_rotation_proof_is_deterministic():
+    priv_pem, pub_pem, address = generate_key_pair()
+    new_pub = pub_pem  # same key for test determinism
+    p1 = create_rotation_proof(address, new_pub, priv_pem)
+    p2 = create_rotation_proof(address, new_pub, priv_pem)
+    assert p1 == p2
 
 
 def test_sign_data_can_be_verified_with_public_key():
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
-    priv_pem, pub_pem = generate_key_pair()
+    priv_pem, pub_pem, _ = generate_key_pair()
     message = "verify me"
     sig_b64 = sign_data(message, priv_pem)
     sig_bytes = base64.b64decode(sig_b64)
@@ -146,7 +157,7 @@ def test_build_transfer_tx_hash_is_correct():
 # ── sign_transaction ──────────────────────────────────────────────────────────
 
 def test_sign_transaction_fills_in_signature_and_public_key():
-    priv_pem, pub_pem = generate_key_pair()
+    priv_pem, pub_pem, _ = generate_key_pair()
     tx = build_transfer("pohA", "pohB", 2.0, 1)
     signed = sign_transaction(tx, priv_pem)
     assert signed.signature is not None and len(signed.signature) > 0
@@ -155,7 +166,7 @@ def test_sign_transaction_fills_in_signature_and_public_key():
 
 
 def test_sign_transaction_raises_when_tx_hash_missing():
-    priv_pem, _ = generate_key_pair()
+    priv_pem, _, _ = generate_key_pair()
     tx = PohTxData(from_addr="pohA", to="pohB", amount=1_000_000_000,
                    fee=0, nonce=1, timestamp=1700000000000, memo="")
     with pytest.raises(ValueError, match="tx.tx_hash missing"):
@@ -163,7 +174,7 @@ def test_sign_transaction_raises_when_tx_hash_missing():
 
 
 def test_sign_transaction_preserves_original_fields():
-    priv_pem, _ = generate_key_pair()
+    priv_pem, _, _ = generate_key_pair()
     tx = build_transfer("pohA", "pohB", 3.0, 7, fee=500, memo="hello")
     signed = sign_transaction(tx, priv_pem)
     assert signed.from_addr == tx.from_addr
@@ -177,7 +188,7 @@ def test_sign_transaction_signature_verifies_with_matching_key():
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
-    priv_pem, pub_pem = generate_key_pair()
+    priv_pem, pub_pem, _ = generate_key_pair()
     tx = build_transfer("pohA", "pohB", 1.0, 1)
     signed = sign_transaction(tx, priv_pem)
 
@@ -188,7 +199,7 @@ def test_sign_transaction_signature_verifies_with_matching_key():
 
 
 def test_to_dict_includes_all_fields_when_signed():
-    priv_pem, _ = generate_key_pair()
+    priv_pem, _, _ = generate_key_pair()
     tx = build_transfer("pohA", "pohB", 1.0, 1)
     signed = sign_transaction(tx, priv_pem)
     d = signed.to_dict()
@@ -229,7 +240,7 @@ def test_compute_job_payment_hash_matches_node_reference_value():
 
 
 def test_sign_job_payment_returns_tx_hash_and_signature():
-    priv_pem, pub_pem = generate_key_pair()
+    priv_pem, pub_pem, _ = generate_key_pair()
     proof = sign_job_payment("job-1", "pohA", "pohMiner", 500_000_000, 0, priv_pem)
     assert proof["txHash"] == compute_job_payment_hash("job-1", "pohA", "pohMiner", 500_000_000, 0)
     assert proof["signature"]

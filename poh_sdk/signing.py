@@ -67,19 +67,25 @@ def _import_crypto():  # type: ignore[return]
         )
 
 
-def generate_key_pair() -> tuple[str, str]:
+def derive_address_from_signing_key(signing_public_key: str) -> str:
+    """Derive the canonical poh address bound to an ed25519 SPKI PEM public key."""
+    digest = hashlib.sha256(signing_public_key.encode()).hexdigest()
+    return "poh" + digest[:40]
+
+
+def generate_key_pair() -> tuple[str, str, str]:
     """Generate a new Ed25519 key pair.
 
     Returns
     -------
-    (signing_private_key_pem, signing_public_key_pem)
-        Both strings are PEM-encoded (PKCS8 private, SPKI public).
+    (signing_private_key_pem, signing_public_key_pem, address)
+        PEM-encoded keys plus the canonical address derived from the public key.
     """
     Ed25519PrivateKey, Encoding, PrivateFormat, PublicFormat, NoEncryption, _ = _import_crypto()
     priv = Ed25519PrivateKey.generate()
     priv_pem = priv.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
     pub_pem  = priv.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
-    return priv_pem, pub_pem
+    return priv_pem, pub_pem, derive_address_from_signing_key(pub_pem)
 
 
 def sign_data(message: str, private_key_pem: str) -> str:
@@ -99,6 +105,19 @@ def create_signing_proof(wallet_address: str, private_key_pem: str) -> str:
     The proof is a base64 Ed25519 signature of the wallet address string.
     """
     return sign_data(wallet_address, private_key_pem)
+
+
+def create_rotation_proof(
+    address: str,
+    new_signing_public_key: str,
+    existing_private_key_pem: str,
+) -> str:
+    """Create the rotation proof required to replace an existing registered key."""
+    payload = json.dumps(
+        {"action": "rotate-key", "address": address, "newSigningPublicKey": new_signing_public_key},
+        separators=(",", ":"),
+    )
+    return sign_data(payload, existing_private_key_pem)
 
 
 # ── Transaction helpers ───────────────────────────────────────────────────────
