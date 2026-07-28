@@ -1,4 +1,12 @@
 from .client import PohClient, PohError
+from .chatcrypto import (
+    derive_encryption_keypair,
+    is_envelope,
+    seal,
+    seal_json,
+    unseal,
+    unseal_json,
+)
 from .signing import (
     PohTxData,
     build_transfer,
@@ -56,6 +64,13 @@ __all__ = [
     "sign_data",
     "sign_job_payment",
     "sign_transaction",
+    # Chat encryption (public-job seal/open)
+    "derive_encryption_keypair",
+    "is_envelope",
+    "seal",
+    "seal_json",
+    "unseal",
+    "unseal_json",
     # Scan types
     "AskJobRef",
     "AskJobResult",

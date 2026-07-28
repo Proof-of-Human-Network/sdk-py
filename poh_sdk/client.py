@@ -10,7 +10,7 @@ Async usage (recommended):
         res = await poh.scan("0xabc...")
 
     # Network mode — auto-picks fastest responding node:
-    async with PohClient(nodes=["https://bootnode.proofofhuman.ge",
+    async with PohClient(nodes=["https://miner.poh.ge",
                                 "https://proofofhuman.ge"]) as poh:
         res = await poh.scan("0xabc...")
 
@@ -59,7 +59,7 @@ from .signing import PohTxData, sign_job_payment
 
 # Default network nodes used when neither base_url nor nodes is provided.
 DEFAULT_NODES: List[str] = [
-    "https://bootnode.proofofhuman.ge",
+    "https://miner.poh.ge",
     "https://proofofhuman.ge",
     "https://poh.assetux.com",
 ]
@@ -449,7 +449,9 @@ class PohClient:
             result = await poh.poll_job_result(ref.job_id)
         """
         opts      = options or AskOptions()
-        max_budget = round(opts.budget * 1_000_000_000)
+        from .signing import decimals_of
+        fee_currency = opts.currency if getattr(opts, "currency", None) and opts.currency != "POH" else None
+        max_budget = round(opts.budget * 10 ** decimals_of(fee_currency))
 
         # 1. Route to a skill
         route = await self._request("POST", "/chat/route", json={
@@ -471,6 +473,7 @@ class PohClient:
             "skillId":   route["skillId"],
             "payload":   route.get("input") or {},
             "maxBudget": max_budget,
+            "currency":  fee_currency,
         }
         if requester_address:
             job_body["requesterAddress"] = requester_address
@@ -486,7 +489,7 @@ class PohClient:
             nonce_info = await self.get_nonce(requester_address)
             job_body["paymentTx"] = sign_job_payment(
                 job_id, requester_address, miner_info.miner_address,
-                max_budget, nonce_info.nonce, opts.private_key_pem,
+                max_budget, nonce_info.nonce, opts.private_key_pem, currency=fee_currency,
             )
 
         return AskJobRef.from_dict(await self._request("POST", "/job", json=job_body))
@@ -509,13 +512,15 @@ class PohClient:
             raise PohError("run_compute: budget must be > 0 — compute jobs always require a fee", 402)
 
         job_id     = options.job_id or f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
-        max_budget = round(options.budget * 1_000_000_000)
+        from .signing import decimals_of
+        fee_currency = options.currency if getattr(options, "currency", None) and options.currency != "POH" else None
+        max_budget = round(options.budget * 10 ** decimals_of(fee_currency))
 
         miner_info = await self.get_miner_info()
         nonce_info = await self.get_nonce(options.wallet_address)
         payment_tx = sign_job_payment(
             job_id, options.wallet_address, miner_info.miner_address,
-            max_budget, nonce_info.nonce, options.private_key_pem,
+            max_budget, nonce_info.nonce, options.private_key_pem, currency=fee_currency,
         )
 
         job_body: dict = {
@@ -525,6 +530,7 @@ class PohClient:
             "dataset":          options.dataset,
             "payload":          {"prompt": prompt},
             "maxBudget":        max_budget,
+            "currency":         fee_currency,
             "requesterAddress": options.wallet_address,
             "paymentTx":        payment_tx,
         }
@@ -677,12 +683,15 @@ class PohClient:
         signing_public_key: str,
         proof: str,
         rotation_proof: Optional[str] = None,
+        encryption_public_key: Optional[str] = None,
     ) -> dict:
         """Register a signing public key for *address*.
 
         *address* must equal :func:`~poh_sdk.signing.derive_address_from_signing_key`.
         *proof* must be a base64 Ed25519 signature of the wallet address string.
         Pass *rotation_proof* when replacing an existing registered key.
+        Pass *encryption_public_key* (raw 32-byte X25519, base64) to also publish the
+        wallet's encryption key so miners can seal public-job chat records to it.
         """
         body: dict = {
             "address":          address,
@@ -691,6 +700,8 @@ class PohClient:
         }
         if rotation_proof:
             body["rotationProof"] = rotation_proof
+        if encryption_public_key:
+            body["encryptionPublicKey"] = encryption_public_key
         return await self._request("POST", "/api/wallet/register-key", json=body)
 
     async def register_key_pair(
@@ -698,12 +709,17 @@ class PohClient:
         key_pair: "KeyPair",
         rotation_proof: Optional[str] = None,
     ) -> dict:
-        """Register a :class:`~poh_sdk.types.KeyPair` from :func:`~poh_sdk.signing.generate_key_pair`."""
+        """Register a :class:`~poh_sdk.types.KeyPair` from :func:`~poh_sdk.signing.generate_key_pair`.
+
+        Also derives and registers the wallet's X25519 encryption key so it can receive
+        sealed public-job chat records.
+        """
         from .signing import create_signing_proof
-        from .types import KeyPair
+        from .chatcrypto import derive_encryption_keypair
         proof = create_signing_proof(key_pair.address, key_pair.signing_private_key)
+        enc_pub = derive_encryption_keypair(key_pair.signing_private_key)["publicKeyB64"]
         return await self.register_signing_key(
-            key_pair.address, key_pair.signing_public_key, proof, rotation_proof,
+            key_pair.address, key_pair.signing_public_key, proof, rotation_proof, enc_pub,
         )
 
     async def transfer(
@@ -750,7 +766,7 @@ class PohClient:
 
             poh = PohClient.sync("https://proofofhuman.ge")
             # or network mode:
-            poh = PohClient.sync(nodes=["https://bootnode.proofofhuman.ge"])
+            poh = PohClient.sync(nodes=["https://miner.poh.ge"])
             res = poh.scan("0xabc...")
         """
         return _SyncPohClient(

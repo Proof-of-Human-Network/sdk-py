@@ -18,7 +18,7 @@ import asyncio
 from poh_sdk import PohClient
 
 async def main():
-    async with PohClient("https://bootnode.proofofhuman.ge") as poh:
+    async with PohClient("https://miner.poh.ge") as poh:
         result = await poh.scan("0xabc...")
         print(result.result)   # True = human, False = bot, None = inconclusive
 
@@ -128,7 +128,7 @@ private_key_pem, public_key_pem, my_address = generate_key_pair()
 
 # 2. Register the public key with your local node (one-time)
 async with PohClient(
-    "https://bootnode.proofofhuman.ge",
+    "https://miner.poh.ge",
     local_base_url="http://127.0.0.1:3456",
 ) as poh:
     await poh.register_signing_key(
@@ -164,7 +164,7 @@ async with PohClient("https://proofofhuman.ge") as poh:
 
 ```python
 poh = PohClient(nodes=[
-    "https://bootnode.proofofhuman.ge",
+    "https://miner.poh.ge",
     "https://proofofhuman.ge",
     "https://poh.assetux.com",
 ])
@@ -232,3 +232,22 @@ poh = PohClient(nodes=[
 ## License
 
 MIT
+
+## Stablecoins (multi-currency)
+
+Five regional stablecoins ride alongside POH: `aiGEL`, `aiKGS`, `aiAMD`,
+`aiETB`, `aiBTN` (2 decimals — 1 unit = 100 raw; POH keeps 9).
+
+```python
+# Transfer 12.50 aiGEL
+tx = build_transfer(from_addr, to, 12.5, nonce + 1, currency="aiGEL")
+
+# Pay a compute job in aiKGS — the miner receives exactly aiKGS
+ref = await poh.run_compute("Summarize…", ComputeOptions(
+    model="qwen3-1.7b", budget=5.0, currency="aiKGS",
+    wallet_address=addr, private_key_pem=key,
+))
+```
+
+POH transactions/job payments hash exactly as before (`currency` enters the
+signed preimage only when non-POH) — existing integrations are unaffected.

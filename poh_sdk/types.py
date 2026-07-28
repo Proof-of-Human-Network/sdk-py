@@ -215,6 +215,9 @@ class AskOptions:
     """PKCS8 PEM Ed25519 private key used to sign the fee payment. Required when
     budget > 0 — skill jobs always require a fee, and the node rejects the job
     outright without a valid signed payment proof."""
+    currency: Optional[str] = None
+    """Fee currency ticker (aiGEL, aiKGS, …). None = POH. `budget` is denominated
+    in this currency's display units; the miner receives exactly this currency."""
 
 
 @dataclass
@@ -232,6 +235,9 @@ class ComputeOptions:
     """Optional Hugging Face dataset id to ground the answer in (must be installed on the node)."""
     job_id: Optional[str] = None
     """Optional explicit job id. Auto-generated if omitted."""
+    currency: Optional[str] = None
+    """Fee currency ticker (aiGEL, aiKGS, …). None = POH. `budget` is denominated
+    in this currency's display units; the miner receives exactly this currency."""
 
 
 @dataclass

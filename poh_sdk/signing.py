@@ -28,6 +28,7 @@ class PohTxData:
     tx_hash: Optional[str] = None
     signature: Optional[str] = None
     signing_public_key: Optional[str] = None
+    currency: Optional[str] = None   # asset ticker; None/omitted for POH
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -39,6 +40,8 @@ class PohTxData:
             "timestamp": self.timestamp,
             "memo":      self.memo,
         }
+        if self.currency and self.currency != "POH":
+            d["currency"] = self.currency
         if self.tx_hash:
             d["txHash"] = self.tx_hash
         if self.signature:
@@ -122,6 +125,14 @@ def create_rotation_proof(
 
 # ── Transaction helpers ───────────────────────────────────────────────────────
 
+# On-chain asset decimals — mirror of the node's /api/assets registry.
+ASSET_DECIMALS = {"POH": 9, "aiGEL": 2, "aiKGS": 2, "aiAMD": 2, "aiETB": 2, "aiBTN": 2}
+
+
+def decimals_of(currency: str | None) -> int:
+    return ASSET_DECIMALS.get(currency or "POH", 9)
+
+
 def compute_tx_hash(
     from_addr: str,
     to: str,
@@ -130,6 +141,7 @@ def compute_tx_hash(
     nonce: int,
     timestamp: int,
     memo: str,
+    currency: str | None = None,
 ) -> str:
     """Return the SHA-256 hex digest of the canonical transaction payload.
 
@@ -138,7 +150,7 @@ def compute_tx_hash(
     rejects the transaction if it doesn't match — ``separators=(",", ":")`` is
     required here, not cosmetic.
     """
-    payload = json.dumps({
+    fields = {
         "from":      from_addr,
         "to":        to,
         "amount":    amount,
@@ -146,7 +158,12 @@ def compute_tx_hash(
         "nonce":     nonce,
         "timestamp": timestamp,
         "memo":      memo,
-    }, separators=(",", ":"))
+    }
+    # LOCKSTEP with the node: currency joins the preimage after memo ONLY when
+    # non-POH — a POH tx hashes byte-identically to the historical shape.
+    if currency and currency != "POH":
+        fields["currency"] = currency
+    payload = json.dumps(fields, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -157,22 +174,28 @@ def build_transfer(
     nonce: int,
     fee: int = 0,
     memo: str = "",
+    currency: str | None = None,
 ) -> PohTxData:
     """Build an unsigned :class:`PohTxData`.
 
     Parameters
     ----------
     amount_poh:
-        Amount in POH (not μPOH). Converted internally via ``round(amount_poh * 1_000_000_000)``.
+        Amount in DISPLAY units of ``currency`` (POH by default). Scaled by the
+        asset's own decimals: POH ×1e9 (μPOH), stablecoins ×100 (2dp raw units).
+    currency:
+        Asset ticker (aiGEL, aiKGS, …). Omit for POH.
     """
-    amount    = round(amount_poh * 1_000_000_000)
+    cur       = currency if currency and currency != "POH" else None
+    amount    = round(amount_poh * 10 ** decimals_of(cur))
     timestamp = int(time.time() * 1000)
-    tx_hash   = compute_tx_hash(from_addr, to, amount, fee, nonce, timestamp, memo)
+    tx_hash   = compute_tx_hash(from_addr, to, amount, fee, nonce, timestamp, memo, cur)
     return PohTxData(
         from_addr = from_addr,
         to        = to,
         amount    = amount,
         fee       = fee,
+        currency  = cur,
         nonce     = nonce,
         timestamp = timestamp,
         memo      = memo,
@@ -208,6 +231,7 @@ def compute_job_payment_hash(
     miner_address: str,
     amount: int,
     nonce: int,
+    currency: str | None = None,
 ) -> str:
     """Compute the canonical payment hash for a job fee.
 
@@ -216,13 +240,17 @@ def compute_job_payment_hash(
     byte-for-byte match the node's own ``computeJobPaymentHash`` — uses compact
     JSON separators (no whitespace), matching JavaScript's ``JSON.stringify``.
     """
-    payload = json.dumps({
+    fields = {
         "jobId":            job_id,
         "requesterAddress": requester_address,
         "minerAddress":     miner_address,
         "amount":           amount,
         "nonce":            nonce,
-    }, separators=(",", ":"))
+    }
+    # LOCKSTEP with the node: currency is the SIXTH key ONLY when non-POH.
+    if currency and currency != "POH":
+        fields["currency"] = currency
+    payload = json.dumps(fields, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -233,6 +261,7 @@ def sign_job_payment(
     amount: int,
     nonce: int,
     private_key_pem: str,
+    currency: str | None = None,
 ) -> dict:
     """Sign a fee payment authorizing a fee-required job (skill execution, or a
     model/dataset compute job).
@@ -241,6 +270,6 @@ def sign_job_payment(
     field of a ``POST /job`` request — the node verifies the signature and debits
     the requester's balance before it will run the job at all.
     """
-    tx_hash = compute_job_payment_hash(job_id, requester_address, miner_address, amount, nonce)
+    tx_hash = compute_job_payment_hash(job_id, requester_address, miner_address, amount, nonce, currency)
     signature = sign_data(tx_hash, private_key_pem)
     return {"txHash": tx_hash, "signature": signature}
